@@ -83,6 +83,7 @@ class FreeCADRPC:
         """Report server and GUI-dispatch health without using the GUI thread."""
         return {
             "success": True,
+            "environment_id": __import__("os").environ.get("CAD_ENVIRONMENT_ID", ""),
             "rpc_server": "running",
             "gui_dispatch": get_dispatch_status(),
         }

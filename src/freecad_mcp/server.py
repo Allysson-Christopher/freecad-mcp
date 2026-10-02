@@ -78,7 +78,7 @@ mcp = FastMCP(
 def get_freecad_connection() -> FreeCADConnection:
     """Get or create a persistent FreeCAD connection"""
     if state.freecad_connection is None:
-        state.freecad_connection = FreeCADConnection(host=state.rpc_host, port=9875)
+        state.freecad_connection = FreeCADConnection(host=state.rpc_host, port=state.rpc_port)
         if not state.freecad_connection.ping():
             logger.error("Failed to ping FreeCAD")
             state.freecad_connection = None
@@ -646,9 +646,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--only-text-feedback", action="store_true", help="Only return text feedback")
     parser.add_argument("--host", type=_validate_host, default="localhost", help="Host address of the FreeCAD RPC server to connect to (default: localhost)")
+    parser.add_argument("--port", type=int, default=9875, help="RPC port of the dedicated FreeCAD instance")
     args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
     state.only_text_feedback = args.only_text_feedback
     state.rpc_host = args.host
+    state.rpc_port = args.port
     logger.info(f"Only text feedback: {state.only_text_feedback}")
     logger.info(f"Connecting to FreeCAD RPC server at: {state.rpc_host}")
     mcp.run()
