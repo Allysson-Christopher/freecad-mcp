@@ -1,15 +1,150 @@
-"""IP-filtered XML-RPC server and helpers for parsing allowed IP/subnet lists."""
+"""IP-filtered, optionally token-authenticated XML-RPC server and helpers.
 
+The server also refuses requests a web page could have sent. The IP allowlist
+cannot stop those: the browser runs on an allowed machine, so a malicious page
+could otherwise call execute_code (CSRF, or DNS rebinding to read the reply).
+"""
+
+import base64
+import hmac
 import ipaddress
 import re
+import socket
+import time
+from email.message import Message
 from socketserver import ThreadingMixIn
-from xmlrpc.server import SimpleXMLRPCServer
+from xmlrpc.server import SimpleXMLRPCRequestHandler, SimpleXMLRPCServer
 
 import FreeCAD
 
 
+_XML_MEDIA_TYPES = frozenset({"text/xml", "application/xml"})
+
+
+def _host_name(host_header: str) -> str:
+    """Return the host of a Host header value, without port or brackets."""
+    host = host_header.strip().lower()
+    if host.startswith("["):  # IPv6 literal, e.g. [::1]:9875
+        return host[1:].split("]", 1)[0]
+    return host.rsplit(":", 1)[0].rstrip(".")
+
+
+def _is_loopback_name(name: str) -> bool:
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def browser_request_rejection(
+    headers: Message, loopback_only: bool
+) -> tuple[int, str] | None:
+    """Return ``(status, reason)`` for a request to refuse, or None to accept it.
+
+    Browsers attach Origin to every POST, and can send an XML body to another
+    origin only after a CORS preflight, which this server never answers.
+    xmlrpc.client sends text/xml without Origin, so MCP clients are unaffected.
+    The Host check stops DNS rebinding where it is decidable: a server bound to
+    loopback is only ever addressed as localhost.
+    """
+    if headers.get("Origin") is not None:
+        return 403, "requests from web pages are not accepted"
+    media_type = (headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+    if media_type not in _XML_MEDIA_TYPES:
+        return 415, "XML-RPC requests must use Content-Type text/xml"
+    host = headers.get("Host")
+    if loopback_only and host is not None and not _is_loopback_name(_host_name(host)):
+        return 403, "the local RPC server only accepts requests addressed to localhost"
+    return None
+
+
+class BrowserGuardRequestHandler(SimpleXMLRPCRequestHandler):
+    """Refuse requests a web page could have sent before they are dispatched."""
+
+    def finish_rejection(self):
+        """Flush the rejection before Windows closes a socket with unread data.
+
+        Never dispatch or parse the rejected body. Drain only a bounded amount
+        for a bounded time; an untrusted client cannot keep this thread alive.
+        """
+        self.close_connection = True
+        self.wfile.flush()
+        try:
+            self.connection.shutdown(socket.SHUT_WR)
+            self.connection.settimeout(0.1)
+            deadline = time.monotonic() + 0.2
+            remaining = 1024 * 1024
+            while remaining > 0 and time.monotonic() < deadline:
+                data = self.connection.recv(min(65536, remaining))
+                if not data:
+                    break
+                remaining -= len(data)
+        except OSError:
+            pass
+
+    def do_POST(self) -> None:
+        rejection = browser_request_rejection(self.headers, self.server.loopback_only)
+        if rejection is None:
+            super().do_POST()
+            return
+        status, reason = rejection
+        FreeCAD.Console.PrintWarning(
+            f"MCP RPC: Rejected request from {self.client_address[0]}: {reason}\n"
+        )
+        body = reason.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")  # the unread body must not be parsed as a request
+        self.end_headers()
+        self.wfile.write(body)
+        self.finish_rejection()
+
+
+def authorization_ok(header_value: str, token: str) -> bool:
+    """Check an ``Authorization`` header against the configured token.
+
+    Accepts ``Bearer <token>`` and HTTP Basic (token in the password field,
+    username ignored) so stdlib clients can use ``http://:token@host:port``
+    URIs. Comparisons are constant-time.
+    """
+    if header_value.startswith("Bearer "):
+        supplied = header_value[len("Bearer "):].strip()
+        return hmac.compare_digest(supplied, token)
+    if header_value.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(header_value[len("Basic "):], validate=True).decode("utf-8")
+        except Exception:
+            return False
+        _, _, password = decoded.partition(":")
+        return hmac.compare_digest(password, token)
+    return False
+
+
+class TokenAuthRequestHandler(BrowserGuardRequestHandler):
+    """Request handler that enforces the server's auth token when one is set."""
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        token = getattr(self.server, "auth_token", "")
+        if not token:
+            return True  # authentication disabled
+        if authorization_ok(self.headers.get("Authorization", ""), token):
+            return True
+        FreeCAD.Console.PrintWarning(
+            f"MCP RPC: Rejected unauthenticated request from {self.client_address[0]}\n"
+        )
+        self.send_error(401, "Unauthorized: valid auth token required")
+        self.finish_rejection()
+        return False
+
+
 class FilteredXMLRPCServer(ThreadingMixIn, SimpleXMLRPCServer):
-    """XML-RPC server that filters connections by allowed IP addresses/subnets.
+    """XML-RPC server that filters connections by allowed IP addresses/subnets
+    and, when a token is configured, requires an Authorization header.
 
     Threaded so get_rpc_status stays answerable while a wedged GUI task blocks
     another request. Document queries and synchronous modelling handlers
@@ -23,8 +158,13 @@ class FilteredXMLRPCServer(ThreadingMixIn, SimpleXMLRPCServer):
 
     daemon_threads = True
 
-    def __init__(self, addr, allowed_ips_str="127.0.0.1", **kwargs):
+    def __init__(self, addr, allowed_ips_str="127.0.0.1", auth_token="", **kwargs):
         self._allowed_networks = _parse_allowed_ips(allowed_ips_str)
+        self.auth_token = auth_token or ""
+        # Remote clients address the server by its LAN name or IP, so only a
+        # loopback-bound server can require a localhost Host header.
+        self.loopback_only = _is_loopback_name(str(addr[0]).lower())
+        kwargs.setdefault("requestHandler", TokenAuthRequestHandler)
         super().__init__(addr, **kwargs)
 
     def verify_request(self, request, client_address):

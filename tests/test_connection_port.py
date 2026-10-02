@@ -9,7 +9,8 @@ def test_connection_uses_dedicated_port():
         server.state.rpc_port = 19875
         with patch.object(server, "FreeCADConnection") as connection:
             connection.return_value.ping.return_value = True
+            connection.return_value.check_addon_version.return_value = None
             server.get_freecad_connection()
-            connection.assert_called_once_with(host=server.state.rpc_host, port=19875)
+            connection.assert_called_once_with(host=server.state.rpc_host, port=19875, token=server.state.auth_token)
     finally:
         server.state.freecad_connection, server.state.rpc_port = old

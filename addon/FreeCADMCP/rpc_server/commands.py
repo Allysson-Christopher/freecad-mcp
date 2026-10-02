@@ -15,14 +15,29 @@ from rpc_server.ip_filter import validate_allowed_ips
 from rpc_server.settings import load_settings, save_settings
 
 
+def _report_server_command(message: str, error: bool = False) -> None:
+    """Show command feedback even when the Report View is closed."""
+    printer = FreeCAD.Console.PrintError if error else FreeCAD.Console.PrintMessage
+    printer(message + "\n")
+    try:
+        FreeCADGui.getMainWindow().statusBar().showMessage(message, 15000)
+    except Exception:
+        # Console feedback remains available if the main window is closing.
+        pass
+
+
 class StartRPCServerCommand:
     def GetResources(self):
         return {"MenuText": "Start RPC Server", "ToolTip": "Start RPC Server"}
 
-    def Activated(self):
-        from . import rpc_server  # late import: avoids circular at module load
-        msg = rpc_server.start_rpc_server()
-        FreeCAD.Console.PrintMessage(msg + "\n")
+    def Activated(self, checked: int = 0) -> None:
+        try:
+            from . import rpc_server  # late import: avoids circular at module load
+            msg = rpc_server.start_rpc_server()
+        except Exception as exc:
+            _report_server_command(f"RPC Server failed to start: {type(exc).__name__}: {exc}", error=True)
+            return
+        _report_server_command(msg)
 
     def IsActive(self):
         return True
@@ -32,10 +47,14 @@ class StopRPCServerCommand:
     def GetResources(self):
         return {"MenuText": "Stop RPC Server", "ToolTip": "Stop RPC Server"}
 
-    def Activated(self):
-        from . import rpc_server
-        msg = rpc_server.stop_rpc_server()
-        FreeCAD.Console.PrintMessage(msg + "\n")
+    def Activated(self, checked: int = 0) -> None:
+        try:
+            from . import rpc_server
+            msg = rpc_server.stop_rpc_server()
+        except Exception as exc:
+            _report_server_command(f"RPC Server failed to stop: {type(exc).__name__}: {exc}", error=True)
+            return
+        _report_server_command(msg)
 
     def IsActive(self):
         return True
@@ -61,6 +80,12 @@ class ToggleRemoteConnectionsCommand:
             FreeCAD.Console.PrintMessage(
                 f"Remote connections enabled. Allowed IPs: {allowed_ips}\n"
             )
+            if not settings.get("auth_token", ""):
+                FreeCAD.Console.PrintWarning(
+                    "Remote connections have no auth token configured — anyone on "
+                    "an allowed IP can execute code in FreeCAD. Set one via "
+                    "'Set Auth Token' in the FreeCAD MCP menu.\n"
+                )
         else:
             FreeCAD.Console.PrintMessage("Remote connections disabled.\n")
 
@@ -123,6 +148,44 @@ class ConfigureAllowedIPsCommand:
         return True
 
 
+class SetAuthTokenCommand:
+    def GetResources(self):
+        return {
+            "MenuText": "Set Auth Token",
+            "ToolTip": "Set the shared-secret token clients must present to connect. Blank disables authentication.",
+        }
+
+    def Activated(self):
+        from . import rpc_server
+        settings = load_settings()
+        current = settings.get("auth_token", "")
+        text, ok = QtWidgets.QInputDialog.getText(
+            None,
+            "Auth Token",
+            "Enter the auth token clients must present (leave blank to disable\n"
+            "authentication). The MCP server passes it via --auth-token or the\n"
+            "FREECAD_MCP_TOKEN environment variable.",
+            QtWidgets.QLineEdit.Normal,
+            current,
+        )
+        if not ok:
+            FreeCAD.Console.PrintMessage("Auth token not changed.\n")
+            return
+        settings["auth_token"] = text.strip()
+        save_settings(settings)
+        if settings["auth_token"]:
+            FreeCAD.Console.PrintMessage("Auth token set — clients must authenticate.\n")
+        else:
+            FreeCAD.Console.PrintMessage("Auth token cleared — authentication disabled.\n")
+        if rpc_server.rpc_server_instance:
+            FreeCAD.Console.PrintMessage(
+                "Restart the RPC server for changes to take effect.\n"
+            )
+
+    def IsActive(self):
+        return True
+
+
 class ToggleAutoStartCommand:
     def GetResources(self):
         settings = load_settings()
@@ -156,6 +219,7 @@ def register_commands() -> None:
     FreeCADGui.addCommand("Toggle_Auto_Start", ToggleAutoStartCommand())
     FreeCADGui.addCommand("Toggle_Remote_Connections", ToggleRemoteConnectionsCommand())
     FreeCADGui.addCommand("Configure_Allowed_IPs", ConfigureAllowedIPsCommand())
+    FreeCADGui.addCommand("Set_Auth_Token", SetAuthTokenCommand())
 
 
 def schedule_toggle_sync() -> None:
